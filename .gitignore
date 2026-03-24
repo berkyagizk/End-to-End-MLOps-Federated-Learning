@@ -1,14 +1,20 @@
-# Python
-venv/
+# Python önbellek dosyaları
 __pycache__/
 *.py[cod]
 
-# Data
-data/*.csv
+# Sanal ortam
+venv/
+env/
 
-# MLflow & Database
-mlflow.db
+# Veri setleri (Büyük dosyalar GitHub'a atılmaz)
+data/
+
+# MLflow kayıtları ve veritabanı
 mlruns/
+mlflow.db
 
-# IDE
+# VSCode ayarları
 .vscode/
+
+# İşletim sistemi kalıntıları
+.DS_Store

@@ -1,5 +1,7 @@
 import flwr as fl
 import numpy as np
+import mlflow
+import joblib
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
 from utils import load_and_partition_data
@@ -38,6 +40,11 @@ class FraudClient(fl.client.NumPyClient):
         loss = log_loss(y_test, model.predict_proba(X_test))
         accuracy = model.score(X_test, y_test)
         print(f"Test Başarımı: {accuracy}")
+        
+        # YENİ EKLENEN: Modeli doğrudan proje ana dizinine .pkl olarak fiziksel kaydediyoruz
+        joblib.dump(model, "best_model.pkl")
+        print(">>> Model başarıyla 'best_model.pkl' olarak kaydedildi! <<<")
+
         return loss, len(X_test), {"accuracy": accuracy}
 
 if __name__ == "__main__":
