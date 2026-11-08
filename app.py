@@ -1,20 +1,20 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from pathlib import Path
 import joblib 
 import pandas as pd
 
 app = FastAPI(title="Credit Card Fraud Detection API", version="1.0")
 
-# --- MODEL YÜKLEME KISMI ---
+# MODEL YÜKLEME KISMI
 try:
-    # Doğrudan az önce oluşturduğumuz dosyayı okuyoruz
-    model = joblib.load("best_model.pkl")
+    model = joblib.load(Path(__file__).resolve().parent / "best_model.pkl")
     print("Model best_model.pkl dosyasından başarıyla yüklendi!")
 except Exception as e:
     print(f"Model yüklenirken hata oluştu: {e}")
     model = None
 
-# --- VERİ ŞEMALARI ---
+#  VERİ ŞEMALARI 
 class TransactionRequest(BaseModel):
     features: list[float]
 
@@ -22,10 +22,10 @@ class PredictionResponse(BaseModel):
     is_fraud: bool
     prediction: int
 
-# --- ENDPOINTLER ---
+#  ENDPOINTLER 
 @app.get("/")
 def read_root():
-    return {"message": "Federe Öğrenme Fraud Detection Servisi Ayakta!"}
+    return {"message": "Federe Öğrenme Fraud Detection Servisi Ayakta."}
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict_fraud(request: TransactionRequest):
