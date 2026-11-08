@@ -5,6 +5,9 @@ __pycache__/
 # Sanal ortam
 venv/
 env/
+.venv/
+.venv-phase0/
+.phase0-cache/
 
 # Veri setleri (Büyük dosyalar GitHub'a atılmaz)
 data/

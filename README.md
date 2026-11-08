@@ -40,3 +40,18 @@ Bu arayüz üzerinden `/predict` endpoint'ine tıklayarak test verilerinizi JSON
 {
   "features": [0.0, -1.3598, -0.0727, 2.5363, 1.3781, -0.3383, 0.4623, 0.2395, 0.0986, 0.3637, 0.0907, -0.5516, -0.6178, -0.9913, -0.3111, 1.4681, -0.4704, 0.2079, 0.0257, 0.4039, 0.2514, -0.0183, 0.2778, -0.1104, 0.0669, 0.1285, -0.1891, 0.1335, -0.0210, 149.62]
 }
+```
+
+## Phase 0: reproducible local environment
+
+Use **64-bit CPython 3.12.10** and a new `.venv-phase0` environment. The existing
+virtual environments are retained. Install the hash-checked `requirements.lock`
+for reproducibility; `requirements.txt` lists the direct dependency pins.
+
+- [Exact setup and dependency decisions](docs/ENVIRONMENT.md)
+- [Dataset acquisition, expected schema, and fingerprint](docs/DATASET.md)
+- [Executed Phase 0 checks and remaining limitations](docs/PHASE0_RESULTS.md)
+
+This phase changes environment setup only. The earlier audit's training and
+inference correctness issues remain open. The Docker instructions above still use
+the original Dockerfile and are not the validated Phase 0 environment.

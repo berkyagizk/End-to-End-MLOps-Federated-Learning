@@ -1,4 +1,7 @@
 venv/
+.venv/
+.venv-phase0/
+.phase0-cache/
 data/
 notebooks/
 __pycache__/

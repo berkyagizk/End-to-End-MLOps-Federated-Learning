@@ -1,0 +1,2 @@
+# Used only to regenerate requirements.lock; not a runtime dependency.
+uv==0.9.18
