@@ -5,18 +5,23 @@ import joblib
 import argparse  # Terminalden ID ve Client sayısını almak için eklendi
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
-from utils import load_and_partition_data
+from utils import load_client_data
 from imblearn.over_sampling import SMOTE
 
 # 1. Argüman okuyucu kurulumu (Terminalden --client-id ve --num-clients alacak)
 parser = argparse.ArgumentParser(description="Flower Client")
 parser.add_argument("--client-id", type=int, required=True, help="Bankanın ID numarası (0, 1, 2...)")
 parser.add_argument("--num-clients", type=int, required=True, help="Toplam banka sayısı")
+parser.add_argument("--seed", type=int, default=42, help="Veri bölme tohumu (tüm istemcilerde aynı)")
 args = parser.parse_args()
 
-# 2. Dinamik veri yükleme (Artık her banka KENDİ verisini alacak)
-data = load_and_partition_data("data/creditcard.csv", num_clients=args.num_clients)
-(X_train, y_train, X_test, y_test) = data[args.client_id] 
+# Load only this client's training and round-validation arrays from the shared CSV.
+try:
+    X_train, y_train, X_val, y_val = load_client_data(
+        "data/creditcard.csv", args.num_clients, args.client_id, seed=args.seed,
+    )
+except ValueError as error:
+    parser.error(str(error))
 
 model = LogisticRegression(max_iter=1)
 
@@ -27,7 +32,7 @@ try:
     print(f"Client {args.client_id}: Model başarıyla iki sınıfla ilklendirildi.")
 except IndexError:
     print(f"Client {args.client_id} HATASI: Bu bankanın verisinde dolandırıcılık örneği (1) bulunamadı!")
-    print("Lütfen utils.py dosyasındaki Stratified split kısmını kontrol et.")
+    print("Lütfen istemcinin eğitim veri bölümünü kontrol et.")
 
 class FraudClient(fl.client.NumPyClient):
     def get_parameters(self, config):
@@ -53,16 +58,16 @@ class FraudClient(fl.client.NumPyClient):
     def evaluate(self, parameters, config):
         model.coef_ = parameters[0]
         model.intercept_ = parameters[1]
-        loss = log_loss(y_test, model.predict_proba(X_test))
-        accuracy = model.score(X_test, y_test)
-        print(f"Client {args.client_id} - Test Başarımı: {accuracy}")
+        loss = log_loss(y_val, model.predict_proba(X_val))
+        accuracy = model.score(X_val, y_val)
+        print(f"Client {args.client_id} - Doğrulama Başarımı: {accuracy}")
         
         # ÇAKIŞMA ÇÖZÜMÜ: Sadece 0. Client modeli kaydetsin
         if args.client_id == 0:
             joblib.dump(model, "best_model.pkl")
             print("Model başarıyla 'best_model.pkl' olarak kaydedildi.")
 
-        return loss, len(X_test), {"accuracy": accuracy}
+        return loss, len(X_val), {"accuracy": accuracy}
 
 if __name__ == "__main__":
     fl.client.start_numpy_client(server_address="127.0.0.1:8080", client=FraudClient())
