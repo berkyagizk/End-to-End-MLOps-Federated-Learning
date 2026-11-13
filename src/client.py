@@ -65,7 +65,7 @@ class FraudClient(fl.client.NumPyClient):
             raise ValueError("Local optimization returned non-finite parameters")
         print(f"Client {self.client_id}: Eğitim tamamlandı (SMOTE ile dengelendi)...")
 
-        return updated, len(X_train_balanced), {}
+        return updated, len(self.X_train), {"post_smote_examples": len(X_train_balanced)}
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)

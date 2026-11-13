@@ -32,10 +32,10 @@ a fresh local optimization at those weights each round. It does not carry
 L-BFGS history between rounds. The one-iteration budget is a local update
 policy and may produce an iteration-limit convergence warning.
 
-The fit reply keeps the existing post-SMOTE sample count. Evaluation applies
-the received weights, uses the client's validation rows, and retains the
-existing client-0 save callback. Server aggregation and checkpoint/export
-policies are outside this phase.
+The fit reply uses the original assigned training count for FedAvg and reports
+the post-SMOTE count separately. See [aggregation](AGGREGATION.md) for the
+weighting policy. Evaluation applies the received weights, uses the client's
+validation rows, and retains the existing client-0 save callback.
 
 ## Verification
 
@@ -53,4 +53,4 @@ weights. The tests intercept the save callback and use no production artifacts.
 The optimizer-start test intentionally checks a solver call in the locked
 scikit-learn version. Reverify it when changing the solver or dependency pins.
 These tests establish local update behavior. They do not establish full
-federated convergence or validate the post-SMOTE aggregation weights.
+federated convergence.
