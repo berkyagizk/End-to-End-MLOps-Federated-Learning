@@ -1,6 +1,8 @@
 import argparse
+import sys
 
 import flwr as fl
+from flwr.common import ndarrays_to_parameters
 import joblib
 import numpy as np
 from imblearn.over_sampling import SMOTE
@@ -8,16 +10,19 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
 
 if __package__:
+    from .experiment import child_run_path, localhost_address, parameter_digest
     from .utils import load_client_data
 else:
+    from experiment import child_run_path, localhost_address, parameter_digest
     from utils import load_client_data
 
 
 class FraudClient(fl.client.NumPyClient):
-    def __init__(self, client_id, X_train, y_train, X_val, y_val):
+    def __init__(self, client_id, X_train, y_train, X_val, y_val, *, model_output=None):
         if not np.array_equal(np.unique(y_train), [0, 1]):
             raise ValueError("Client training labels must contain both classes 0 and 1 only")
         self.client_id = client_id
+        self.model_output = model_output
         self.X_train = X_train
         self.y_train = np.asarray(y_train, dtype=np.int64)
         self.X_val, self.y_val = X_val, y_val
@@ -56,6 +61,7 @@ class FraudClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
+        metrics = self.round_metrics(config)
         smote = SMOTE(random_state=42)
         X_train_balanced, y_train_balanced = smote.fit_resample(self.X_train, self.y_train)
 
@@ -65,7 +71,8 @@ class FraudClient(fl.client.NumPyClient):
             raise ValueError("Local optimization returned non-finite parameters")
         print(f"Client {self.client_id}: Eğitim tamamlandı (SMOTE ile dengelendi)...")
 
-        return updated, len(self.X_train), {"post_smote_examples": len(X_train_balanced)}
+        metrics["post_smote_examples"] = len(X_train_balanced)
+        return updated, len(self.X_train), metrics
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
@@ -73,11 +80,20 @@ class FraudClient(fl.client.NumPyClient):
         accuracy = self.model.score(self.X_val, self.y_val)
         print(f"Client {self.client_id} - Doğrulama Başarımı: {accuracy}")
 
-        if self.client_id == 0:
-            joblib.dump(self.model, "best_model.pkl")
-            print("Model başarıyla 'best_model.pkl' olarak kaydedildi.")
+        if self.client_id == 0 and self.model_output is not None:
+            joblib.dump(self.model, self.model_output)
+            print(f"Saved validation-round model to {self.model_output}")
 
-        return loss, len(self.X_val), {"accuracy": accuracy}
+        return loss, len(self.X_val), {"accuracy": accuracy, **self.round_metrics(config)}
+
+    def round_metrics(self, config):
+        if "server_round" not in config:
+            return {}
+        return {
+            "client_id": self.client_id,
+            "server_round": config["server_round"],
+            "received_sha256": parameter_digest(ndarrays_to_parameters(self.get_parameters({}))),
+        }
 
 
 def main():
@@ -85,14 +101,27 @@ def main():
     parser.add_argument("--client-id", type=int, required=True, help="Bankanın ID numarası (0, 1, 2...)")
     parser.add_argument("--num-clients", type=int, required=True, help="Toplam banka sayısı")
     parser.add_argument("--seed", type=int, default=42, help="Veri bölme tohumu (tüm istemcilerde aynı)")
+    parser.add_argument("--run-dir", required=True, help="Isolated experiment directory")
+    parser.add_argument("--port", type=int, required=True, help="Local Flower server port")
     args = parser.parse_args()
     try:
-        data = load_client_data("data/creditcard.csv", args.num_clients, args.client_id, seed=args.seed)
-        client = FraudClient(args.client_id, *data)
+        run_dir = child_run_path(args.run_dir)
+        address = localhost_address(args.port)
+        model_output = run_dir / "model.pkl"
+        if args.client_id == 0 and (model_output.exists() or model_output.is_symlink()):
+            raise ValueError("Model output already exists in the experiment directory")
+        data = load_client_data(run_dir / "input.csv", args.num_clients, args.client_id, seed=args.seed)
+        client = FraudClient(args.client_id, *data, model_output=model_output)
     except ValueError as error:
         parser.error(str(error))
 
-    fl.client.start_numpy_client(server_address="127.0.0.1:8080", client=client)
+    if sys.platform == "win32":
+        # Initialize the pinned sklearn controller before gRPC starts loading
+        # modules on background threads during Windows' DLL enumeration.
+        from sklearn.utils.parallel import _get_threadpool_controller
+
+        _get_threadpool_controller()
+    fl.client.start_numpy_client(server_address=address, client=client)
 
 
 if __name__ == "__main__":

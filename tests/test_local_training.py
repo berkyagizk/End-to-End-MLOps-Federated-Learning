@@ -56,7 +56,8 @@ class LocalTrainingTests(unittest.TestCase):
         self.y_val = self.y[[0, 1, 24, 25]]
 
     def client(self, client_id=1, y=None):
-        return FraudClient(client_id, self.X, self.y if y is None else y, self.X_val, self.y_val)
+        return FraudClient(client_id, self.X, self.y if y is None else y, self.X_val, self.y_val,
+                           model_output="synthetic-model.pkl")
 
     def fit_with_observed_start(self, flower_client, incoming):
         starts = []
@@ -159,4 +160,4 @@ class LocalTrainingTests(unittest.TestCase):
         self.assertAlmostEqual(result.loss, log_loss(self.y_val, prob_fraud))
         self.assertEqual(result.metrics["accuracy"], np.mean((prob_fraud > 0.5) == self.y_val))
         np.testing.assert_array_equal(flatten(client.get_parameters({})), flatten(incoming))
-        save.assert_called_once_with(client.model, "best_model.pkl")
+        save.assert_called_once_with(client.model, "synthetic-model.pkl")

@@ -1,6 +1,6 @@
 import argparse
+import json
 import math
-import os
 import sys
 
 import flwr as fl
@@ -9,8 +9,10 @@ import mlflow
 import numpy as np
 
 if __package__:
+    from .experiment import child_run_path, localhost_address, parameter_digest
     from .preprocessing import FEATURE_NAMES
 else:
+    from experiment import child_run_path, localhost_address, parameter_digest
     from preprocessing import FEATURE_NAMES
 
 
@@ -104,21 +106,104 @@ def build_strategy(num_clients):
     )
 
 
+class ControlledStrategy(MLflowStrategy):
+    """Require a complete round and record the parameters sent and received."""
+
+    def __init__(self, num_clients, rounds, report):
+        super().__init__(
+            min_fit_clients=num_clients,
+            min_evaluate_clients=num_clients,
+            min_available_clients=num_clients,
+            evaluate_metrics_aggregation_fn=weighted_accuracy,
+            on_fit_config_fn=lambda round_number: {"server_round": round_number},
+            on_evaluate_config_fn=lambda round_number: {"server_round": round_number},
+            accept_failures=False,
+        )
+        self.client_ids = set(range(num_clients))
+        self.rounds = rounds
+        self.report = report
+        self.round_records = []
+
+    def configure_fit(self, server_round, parameters, client_manager):
+        self.sent_sha256 = parameter_digest(parameters)
+        return super().configure_fit(server_round, parameters, client_manager)
+
+    def checked_replies(self, stage, server_round, results, failures, expected_sha256):
+        ids = [result.metrics.get("client_id") for _, result in results]
+        if (failures or len(ids) != len(self.client_ids)
+                or any(type(client_id) is not int for client_id in ids) or set(ids) != self.client_ids):
+            raise RuntimeError(
+                f"Incomplete {stage} round {server_round}: expected clients {sorted(self.client_ids)}, "
+                f"received {ids}, {len(failures)} failures: {failures!r}"
+            )
+        replies = []
+        for _, result in results:
+            if (result.metrics.get("server_round") != server_round
+                    or result.metrics.get("received_sha256") != expected_sha256):
+                raise RuntimeError(f"{stage} round {server_round}: client reported unexpected global parameters")
+            replies.append({**result.metrics, "num_examples": result.num_examples})
+        return sorted(replies, key=lambda reply: reply["client_id"])
+
+    def aggregate_fit(self, server_round, results, failures):
+        replies = self.checked_replies("fit", server_round, results, failures, self.sent_sha256)
+        parameters, metrics = super().aggregate_fit(server_round, results, failures)
+        self.aggregate_sha256 = parameter_digest(parameters)
+        self.round_records.append({
+            "round": server_round, "sent_sha256": self.sent_sha256,
+            "aggregate_sha256": self.aggregate_sha256, "fit": replies,
+        })
+        return parameters, metrics
+
+    def aggregate_evaluate(self, server_round, results, failures):
+        replies = self.checked_replies("validation", server_round, results, failures, self.aggregate_sha256)
+        loss, metrics = super().aggregate_evaluate(server_round, results, failures)
+        self.round_records[-1].update(validation=replies, loss=loss, accuracy=metrics["accuracy"])
+        print(f"Completed round {server_round}/{self.rounds} with all clients", flush=True)
+        return loss, metrics
+
+    def finish(self, history):
+        if [row["round"] for row in self.round_records if "validation" in row] != list(range(1, self.rounds + 1)):
+            raise RuntimeError("Flower returned before all fit and validation rounds completed")
+        if len(history.losses_distributed) != self.rounds:
+            raise RuntimeError("Flower history is missing validation rounds")
+        with self.report.open("x", encoding="utf-8") as stream:
+            json.dump(self.round_records, stream, indent=2, allow_nan=False)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Flower Server")
     parser.add_argument("--num-clients", type=int, required=True, help="Beklenen toplam banka sayısı")
+    parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--rounds", type=int, required=True)
+    parser.add_argument("--round-timeout", type=float, required=True)
     args = parser.parse_args()
+    try:
+        run_dir = child_run_path(args.run_dir)
+        address = localhost_address(args.port)
+        if args.num_clients < 2 or args.rounds < 1 or not 0 < args.round_timeout < math.inf:
+            raise ValueError("Expected at least two clients, one round, and a positive finite round timeout")
+        for name in ("tracking.sqlite", "artifacts", "mlruns", "rounds.json"):
+            path = run_dir / name
+            if path.exists() or path.is_symlink():
+                raise ValueError(f"Experiment output already exists: {path}")
+    except ValueError as error:
+        parser.error(str(error))
 
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    db_path = os.path.join(os.path.dirname(current_dir), "mlflow.db")
-    mlflow.set_tracking_uri(f"sqlite:///{db_path}")
-    mlflow.set_experiment("Credit_Card_Fraud_Federated_Learning")
-    print(f"MLflow DB Yolu: {db_path}")
-    fl.server.start_server(
-        server_address="0.0.0.0:8080",
-        config=fl.server.ServerConfig(num_rounds=3),
-        strategy=build_strategy(args.num_clients),
+    db_path = run_dir / "tracking.sqlite"
+    mlflow.set_tracking_uri(f"sqlite:///{db_path.as_posix()}")
+    experiment_id = mlflow.create_experiment(
+        "Credit_Card_Fraud_Federated_Learning", artifact_location=(run_dir / "artifacts").as_uri(),
     )
+    mlflow.set_experiment(experiment_id=experiment_id)
+    print(f"MLflow database: {db_path}", flush=True)
+    strategy = ControlledStrategy(args.num_clients, args.rounds, run_dir / "rounds.json")
+    history = fl.server.start_server(
+        server_address=address,
+        config=fl.server.ServerConfig(num_rounds=args.rounds, round_timeout=args.round_timeout),
+        strategy=strategy,
+    )
+    strategy.finish(history)
 
 
 if __name__ == "__main__":

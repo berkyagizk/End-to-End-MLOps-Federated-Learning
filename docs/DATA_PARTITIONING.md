@@ -8,17 +8,15 @@ model separate institutions with private datasets or naturally different fraud
 rates.
 
 ```powershell
-# Validate assignments without launching Flower, training, or writing a model.
-& .\.venv-phase0\Scripts\python.exe -B -m unittest discover -s tests -v
+# Validate assignments without launching Flower or fitting a model.
+& .\.venv-phase0\Scripts\python.exe -B -X utf8 -m unittest discover -s tests -p test_partitions.py -v
 ```
 
 The tests use synthetic data and also check the local reference CSV when it is
 present. The reference check reports counts per client and per split, in label
-order `[legitimate, fraud]`. For a future simulation run, pass `--num-clients N`
-and optionally `--seed SEED` to `run_simulation.py`. The seed defaults to 42 and
-the launcher passes the same value to each client. When starting clients
-manually, use the same CSV, client count, and seed for each process, with client
-IDs from `0` to `N - 1`.
+order `[legitimate, fraud]`. See [controlled simulation](SIMULATION.md) for
+the required launcher options. The seed defaults to 42 and the launcher passes
+the same value to each client.
 
 ## Row identity and duplicate policy
 
