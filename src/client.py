@@ -1,73 +1,99 @@
+import argparse
+
 import flwr as fl
-import numpy as np
-import mlflow
 import joblib
-import argparse  # Terminalden ID ve Client sayısını almak için eklendi
+import numpy as np
+from imblearn.over_sampling import SMOTE
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
-from utils import load_client_data
-from imblearn.over_sampling import SMOTE
 
-# 1. Argüman okuyucu kurulumu (Terminalden --client-id ve --num-clients alacak)
-parser = argparse.ArgumentParser(description="Flower Client")
-parser.add_argument("--client-id", type=int, required=True, help="Bankanın ID numarası (0, 1, 2...)")
-parser.add_argument("--num-clients", type=int, required=True, help="Toplam banka sayısı")
-parser.add_argument("--seed", type=int, default=42, help="Veri bölme tohumu (tüm istemcilerde aynı)")
-args = parser.parse_args()
+if __package__:
+    from .utils import load_client_data
+else:
+    from utils import load_client_data
 
-# Load only this client's training and round-validation arrays from the shared CSV.
-try:
-    X_train, y_train, X_val, y_val = load_client_data(
-        "data/creditcard.csv", args.num_clients, args.client_id, seed=args.seed,
-    )
-except ValueError as error:
-    parser.error(str(error))
-
-model = LogisticRegression(max_iter=1)
-
-try:
-    idx_0 = np.where(y_train == 0)[0][0]
-    idx_1 = np.where(y_train == 1)[0][0]
-    model.fit(X_train[[idx_0, idx_1]], y_train[[idx_0, idx_1]])
-    print(f"Client {args.client_id}: Model başarıyla iki sınıfla ilklendirildi.")
-except IndexError:
-    print(f"Client {args.client_id} HATASI: Bu bankanın verisinde dolandırıcılık örneği (1) bulunamadı!")
-    print("Lütfen istemcinin eğitim veri bölümünü kontrol et.")
 
 class FraudClient(fl.client.NumPyClient):
+    def __init__(self, client_id, X_train, y_train, X_val, y_val):
+        if not np.array_equal(np.unique(y_train), [0, 1]):
+            raise ValueError("Client training labels must contain both classes 0 and 1 only")
+        self.client_id = client_id
+        self.X_train = X_train
+        self.y_train = np.asarray(y_train, dtype=np.int64)
+        self.X_val, self.y_val = X_val, y_val
+        self.n_features = X_train.shape[1]
+
+        # Every client can supply the same initial global parameters to Flower.
+        # Set the fitted attributes needed for prediction before the first fit.
+        self.model = LogisticRegression(solver="lbfgs", max_iter=1, warm_start=True)
+        self.model.classes_ = np.array([0, 1])
+        self.model.n_features_in_ = self.n_features
+        self.model.coef_ = np.zeros((1, self.n_features), dtype=np.float64)
+        self.model.intercept_ = np.zeros(1, dtype=np.float64)
+
     def get_parameters(self, config):
-        if hasattr(model, "coef_"):
-            return [model.coef_, model.intercept_]
-        else:
-            return []
+        return [self.model.coef_.copy(), self.model.intercept_.copy()]
+
+    def set_parameters(self, parameters):
+        if not isinstance(parameters, (list, tuple)) or len(parameters) != 2:
+            raise ValueError("Expected two parameter arrays: coefficients and intercept")
+
+        validated = []
+        for name, value, shape in (
+            ("Coefficients", parameters[0], (1, self.n_features)),
+            ("Intercept", parameters[1], (1,)),
+        ):
+            if not isinstance(value, np.ndarray) or value.dtype.kind != "f":
+                raise ValueError(f"{name} must be a floating-point NumPy array")
+            if value.shape != shape:
+                raise ValueError(f"{name} must have shape {shape}, got {value.shape}")
+            with np.errstate(over="ignore", invalid="ignore"):
+                array = value.astype(np.float64, copy=True)
+            if not np.isfinite(array).all():
+                raise ValueError(f"{name} must contain only finite float64 values")
+            validated.append(array)
+        self.model.coef_, self.model.intercept_ = validated
 
     def fit(self, parameters, config):
-        model.coef_ = parameters[0]
-        model.intercept_ = parameters[1]
-        
-        # --- SMOTE ENTEGRASYONU ---
+        self.set_parameters(parameters)
         smote = SMOTE(random_state=42)
-        X_train_balanced, y_train_balanced = smote.fit_resample(X_train, y_train)
-        
-        model.fit(X_train_balanced, y_train_balanced)
-        print(f"Client {args.client_id}: Eğitim tamamlandı (SMOTE ile dengelendi)...")
-        
-        # Sunucuya yeni (dengeli) veri uzunluğunu yolluyoruz, böylece sunucu doğru ağırlıklı ortalama yapabiliriz.
-        return [model.coef_, model.intercept_], len(X_train_balanced), {}
+        X_train_balanced, y_train_balanced = smote.fit_resample(self.X_train, self.y_train)
+
+        self.model.fit(X_train_balanced, y_train_balanced)
+        updated = self.get_parameters(config)
+        if not all(np.isfinite(array).all() for array in updated):
+            raise ValueError("Local optimization returned non-finite parameters")
+        print(f"Client {self.client_id}: Eğitim tamamlandı (SMOTE ile dengelendi)...")
+
+        return updated, len(X_train_balanced), {}
 
     def evaluate(self, parameters, config):
-        model.coef_ = parameters[0]
-        model.intercept_ = parameters[1]
-        loss = log_loss(y_val, model.predict_proba(X_val))
-        accuracy = model.score(X_val, y_val)
-        print(f"Client {args.client_id} - Doğrulama Başarımı: {accuracy}")
-        
-        # ÇAKIŞMA ÇÖZÜMÜ: Sadece 0. Client modeli kaydetsin
-        if args.client_id == 0:
-            joblib.dump(model, "best_model.pkl")
+        self.set_parameters(parameters)
+        loss = log_loss(self.y_val, self.model.predict_proba(self.X_val))
+        accuracy = self.model.score(self.X_val, self.y_val)
+        print(f"Client {self.client_id} - Doğrulama Başarımı: {accuracy}")
+
+        if self.client_id == 0:
+            joblib.dump(self.model, "best_model.pkl")
             print("Model başarıyla 'best_model.pkl' olarak kaydedildi.")
 
-        return loss, len(X_val), {"accuracy": accuracy}
+        return loss, len(self.X_val), {"accuracy": accuracy}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Flower Client")
+    parser.add_argument("--client-id", type=int, required=True, help="Bankanın ID numarası (0, 1, 2...)")
+    parser.add_argument("--num-clients", type=int, required=True, help="Toplam banka sayısı")
+    parser.add_argument("--seed", type=int, default=42, help="Veri bölme tohumu (tüm istemcilerde aynı)")
+    args = parser.parse_args()
+    try:
+        data = load_client_data("data/creditcard.csv", args.num_clients, args.client_id, seed=args.seed)
+        client = FraudClient(args.client_id, *data)
+    except ValueError as error:
+        parser.error(str(error))
+
+    fl.client.start_numpy_client(server_address="127.0.0.1:8080", client=client)
+
 
 if __name__ == "__main__":
-    fl.client.start_numpy_client(server_address="127.0.0.1:8080", client=FraudClient())
+    main()
