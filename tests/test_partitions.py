@@ -12,7 +12,7 @@ def make_frame():
     positions = np.arange(2320, dtype=float)
     return pd.DataFrame({
         "Time": positions,
-        "V1": positions / 10,
+        **{f"V{i}": positions / (10 * i) for i in range(1, 29)},
         "Amount": positions + 1,
         "Class": np.r_[np.zeros(2200, dtype=int), np.ones(120, dtype=int)],
     })
@@ -98,7 +98,7 @@ class PartitionTests(unittest.TestCase):
         np.testing.assert_array_equal(train_labels, frame.iloc[client.train]["Class"])
         np.testing.assert_array_equal(validation_labels, frame.iloc[client.validation]["Class"])
         pooled_train = frame.iloc[np.concatenate([part.train for part in plan.clients])]
-        for index, column in ((0, "Time"), (2, "Amount")):
+        for index, column in ((0, "Time"), (29, "Amount")):
             mean, scale = pooled_train[column].mean(), pooled_train[column].std(ddof=0)
             np.testing.assert_allclose(train[:, index], (frame.iloc[client.train][column] - mean) / scale)
             np.testing.assert_allclose(validation[:, index], (frame.iloc[client.validation][column] - mean) / scale)

@@ -14,6 +14,10 @@ Kredi kartı dolandırıcılığı tespitini, bankalar arasında veri gizliliği
 
 ## 🚀 Projeyi Docker ile Canlıya Alma (Deployment)
 
+Tahmin için `FRAUD_MODEL_PATH` ile güvenilir bir model ve eşleşen ön işleme
+meta verisi sağlanmalıdır. Mevcut `best_model.pkl` için doğrulanmış meta veri
+yoktur. Kurulum ayrıntıları için [Phase 1B preprocessing](docs/PREPROCESSING.md).
+
 Bu proje, eğitilmiş Federe Öğrenme (Federated Learning) modelini mikroservis mimarisine uygun olarak dış dünyaya açmak için **FastAPI** ve **Docker** kullanmaktadır. Projeyi herhangi bir ortamda tek tıkla çalıştırmak için aşağıdaki adımları izleyebilirsiniz.
 
 ### Ön Koşullar

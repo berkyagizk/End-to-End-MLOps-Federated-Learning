@@ -3,7 +3,11 @@ from numbers import Integral
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+
+if __package__:
+    from .preprocessing import FeaturePreprocessor
+else:
+    from preprocessing import FeaturePreprocessor
 
 
 MIN_TRAIN_PER_CLASS = 6  # SMOTE's default k_neighbors=5 needs at least six rows.
@@ -87,6 +91,12 @@ def build_partition_plan(frame, num_clients=3, *, seed=42):
     )
 
 
+def fit_partition_preprocessor(features, plan):
+    """Fit the simulation's shared transformer on global training rows only."""
+    training_rows = np.sort(np.concatenate([client.train for client in plan.clients]))
+    return FeaturePreprocessor.fit(features.iloc[training_rows])
+
+
 def load_client_data(file_path, num_clients, client_id, *, seed=42):
     """Return training and round-validation arrays for exactly one simulated client."""
     validate_client_count(num_clients)
@@ -99,15 +109,7 @@ def load_client_data(file_path, num_clients, client_id, *, seed=42):
     features = frame.drop(columns="Class")
     labels = frame["Class"].to_numpy()
 
-    # A shared training-only scaler keeps all clients in the same coordinate system.
-    # The central CSV and pooled training statistics are specific to this simulation.
-    columns = ["Amount", "Time"]
-    # Fit in source-row order so floating-point reductions also use a fixed order.
-    training_rows = np.sort(np.concatenate([client.train for client in plan.clients]))
-    scaler = StandardScaler().fit(features[columns].iloc[training_rows])
-
-    train = features.iloc[partition.train].copy()
-    validation = features.iloc[partition.validation].copy()
-    train[columns] = scaler.transform(train[columns])
-    validation[columns] = scaler.transform(validation[columns])
-    return train.to_numpy(), labels[partition.train], validation.to_numpy(), labels[partition.validation]
+    preprocessor = fit_partition_preprocessor(features, plan)
+    train = preprocessor.transform(features.iloc[partition.train])
+    validation = preprocessor.transform(features.iloc[partition.validation])
+    return train, labels[partition.train], validation, labels[partition.validation]

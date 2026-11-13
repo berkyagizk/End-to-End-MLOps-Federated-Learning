@@ -69,8 +69,9 @@ scaler fits only the union of the client training rows, in source-row order
 for reproducible statistics across client counts. Each client transforms
 its own training and validation rows using that common feature scale. This is
 a central-simulation policy that relies on pooled training statistics. It does
-not implement a scaler for independent institutions. Persistence of the scaler
-and matching transformations in FastAPI remain open for later work.
+not implement a scaler for independent institutions. See
+[Phase 1B preprocessing](PREPROCESSING.md) for the shared transformer and
+the requirements for pairing preprocessing metadata with a serving model.
 
 Class-stratified random splits approximate an IID benchmark. They do not measure
 performance under temporal drift or institutional differences. Partition checks
