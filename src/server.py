@@ -9,9 +9,11 @@ import mlflow
 import numpy as np
 
 if __package__:
+    from .evaluation import COUNT_KEYS, aggregate_validation_metrics
     from .experiment import child_run_path, localhost_address, parameter_digest
     from .preprocessing import FEATURE_NAMES
 else:
+    from evaluation import COUNT_KEYS, aggregate_validation_metrics
     from experiment import child_run_path, localhost_address, parameter_digest
     from preprocessing import FEATURE_NAMES
 
@@ -37,6 +39,13 @@ def validate_parameters(parameters, source):
 
 
 def weighted_accuracy(results):
+    # Retain the legacy accuracy-only library interface. New controlled runs
+    # require the full diagnostic schema and never use this fallback.
+    diagnostic_keys = (*COUNT_KEYS, "threshold", "validation_examples", "precision", "recall",
+                       "f1", "specificity", "balanced_accuracy", "average_precision")
+    if any(isinstance(metrics, dict) and any(key in metrics or f"{key}_defined" in metrics for key in diagnostic_keys)
+           for _, metrics in results):
+        return aggregate_validation_metrics(results)
     terms = []
     total = 0
     for count, metrics in results:
@@ -89,8 +98,18 @@ class MLflowStrategy(fl.server.strategy.FedAvg):
             print(f">>> Başarı Oranı: {acc} - MLflow'a yazılıyor...")
             try:
                 with mlflow.start_run(run_name=f"Round_{server_round}"):
-                    mlflow.log_metric("accuracy", acc, step=server_round)
+                    for key, value in metrics.items():
+                        if isinstance(value, (int, float, bool)):
+                            mlflow.log_metric(key, float(value), step=server_round)
                     mlflow.log_metric("loss", loss if loss is not None else 0.0, step=server_round)
+                    for _, result in results:
+                        client_id = result.metrics.get("client_id")
+                        if type(client_id) is int and "average_precision_defined" in result.metrics:
+                            mlflow.log_metric(f"client_{client_id}_average_precision_defined",
+                                              float(result.metrics["average_precision_defined"]), step=server_round)
+                            if result.metrics["average_precision_defined"]:
+                                mlflow.log_metric(f"client_{client_id}_average_precision",
+                                                  result.metrics["average_precision"], step=server_round)
                 print(">>> MLflow yazma işlemi başarıyla tamamlandı.")
             except Exception as e:
                 print(f">>> MLflow HATASI: {e}")
@@ -114,7 +133,7 @@ class ControlledStrategy(MLflowStrategy):
             min_fit_clients=num_clients,
             min_evaluate_clients=num_clients,
             min_available_clients=num_clients,
-            evaluate_metrics_aggregation_fn=weighted_accuracy,
+            evaluate_metrics_aggregation_fn=aggregate_validation_metrics,
             on_fit_config_fn=lambda round_number: {"server_round": round_number},
             on_evaluate_config_fn=lambda round_number: {"server_round": round_number},
             accept_failures=False,
@@ -129,6 +148,8 @@ class ControlledStrategy(MLflowStrategy):
         return super().configure_fit(server_round, parameters, client_manager)
 
     def checked_replies(self, stage, server_round, results, failures, expected_sha256):
+        if any(not isinstance(result.metrics, dict) for _, result in results):
+            raise ValueError(f"{stage} round {server_round}: metrics must be a dictionary")
         ids = [result.metrics.get("client_id") for _, result in results]
         if (failures or len(ids) != len(self.client_ids)
                 or any(type(client_id) is not int for client_id in ids) or set(ids) != self.client_ids):
@@ -158,6 +179,7 @@ class ControlledStrategy(MLflowStrategy):
         replies = self.checked_replies("validation", server_round, results, failures, self.aggregate_sha256)
         loss, metrics = super().aggregate_evaluate(server_round, results, failures)
         self.round_records[-1].update(validation=replies, loss=loss, accuracy=metrics["accuracy"])
+        self.round_records[-1]["validation_metrics"] = {**metrics, "loss": loss}
         print(f"Completed round {server_round}/{self.rounds} with all clients", flush=True)
         return loss, metrics
 

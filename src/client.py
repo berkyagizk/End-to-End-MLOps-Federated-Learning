@@ -7,12 +7,13 @@ import joblib
 import numpy as np
 from imblearn.over_sampling import SMOTE
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import log_loss
 
 if __package__:
+    from .evaluation import evaluate_binary
     from .experiment import child_run_path, localhost_address, parameter_digest
     from .utils import load_client_data
 else:
+    from evaluation import evaluate_binary
     from experiment import child_run_path, localhost_address, parameter_digest
     from utils import load_client_data
 
@@ -76,15 +77,23 @@ class FraudClient(fl.client.NumPyClient):
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
-        loss = log_loss(self.y_val, self.model.predict_proba(self.X_val))
-        accuracy = self.model.score(self.X_val, self.y_val)
+        probabilities = np.asarray(self.model.predict_proba(self.X_val))
+        if (not np.array_equal(self.model.classes_, [0, 1])
+                or probabilities.shape != (len(self.y_val), 2)
+                or probabilities.dtype.kind not in "iuf"
+                or not np.isfinite(probabilities).all()
+                or not ((0 <= probabilities) & (probabilities <= 1)).all()
+                or not np.allclose(probabilities.sum(axis=1), 1.0, rtol=0, atol=1e-12)):
+            raise ValueError("Expected finite binary probabilities in class order [0, 1], summing to one")
+        loss, metrics = evaluate_binary(self.y_val, probabilities[:, 1])
+        accuracy = metrics["accuracy"]
         print(f"Client {self.client_id} - Doğrulama Başarımı: {accuracy}")
 
         if self.client_id == 0 and self.model_output is not None:
             joblib.dump(self.model, self.model_output)
             print(f"Saved validation-round model to {self.model_output}")
 
-        return loss, len(self.X_val), {"accuracy": accuracy, **self.round_metrics(config)}
+        return loss, len(self.X_val), {**metrics, **self.round_metrics(config)}
 
     def round_metrics(self, config):
         if "server_round" not in config:

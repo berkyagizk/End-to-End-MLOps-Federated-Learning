@@ -17,6 +17,7 @@ import pandas as pd
 
 from run_simulation import PROJECT_ROOT, prepare_run, run_simulation, wait_for_completion
 from src.experiment import external_run_path
+from src.evaluation import aggregate_validation_metrics
 from src.preprocessing import FEATURE_NAMES
 from src.server import ControlledStrategy
 from src.utils import build_partition_plan
@@ -125,7 +126,8 @@ class SyntheticSimulationTests(unittest.TestCase):
             root = Path(evidence).resolve()
             external_run_path(root).mkdir(mode=0o700)
         else:
-            root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="fraud-smoke-")))
+            # Windows TEMP can use an 8.3 alias; compare canonical paths like MLflow.
+            root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="fraud-smoke-"))).resolve()
         dataset = root / "synthetic.csv"
         frame = synthetic_csv(dataset)
         digest = hashlib.sha256(dataset.read_bytes()).digest()
@@ -157,18 +159,33 @@ class SyntheticSimulationTests(unittest.TestCase):
                 split = "train" if stage == "fit" else "validation"
                 self.assertEqual([reply["num_examples"] for reply in replies],
                                  [len(getattr(client, split)) for client in plan.clients])
+            pooled = aggregate_validation_metrics([(r["num_examples"], r) for r in record["validation"]])
+            self.assertEqual(record["validation_metrics"], {**pooled, "loss": record["loss"]})
+            self.assertEqual(record["accuracy"], pooled["accuracy"])
+            self.assertFalse(pooled["global_average_precision_computed"])
+            self.assertNotIn("average_precision", pooled)
         uri = (run / "tracking.sqlite").resolve().as_uri() + "?mode=ro"
         with closing(sqlite3.connect(uri, uri=True)) as connection:
             rows = connection.execute("SELECT name, status, artifact_uri FROM runs ORDER BY name").fetchall()
             self.assertEqual([(name, status) for name, status, _ in rows],
                              [("Round_1", "FINISHED"), ("Round_2", "FINISHED")])
             self.assertTrue(all(unquote(uri).startswith(unquote((run / "artifacts").as_uri()) + "/")
-                                for _, _, uri in rows))
+                                for _, _, uri in rows), (rows, (run / "artifacts").as_uri()))
             metrics = connection.execute(
                 "SELECT r.name, m.key, m.value FROM metrics m JOIN runs r ON r.run_uuid=m.run_uuid"
             ).fetchall()
-            self.assertEqual(len(metrics), 4)
             for record in records:
+                expected_metrics = {key: float(value) for key, value in record["validation_metrics"].items()
+                                    if isinstance(value, (int, float, bool))}
+                for reply in record["validation"]:
+                    client_id = reply["client_id"]
+                    expected_metrics[f"client_{client_id}_average_precision_defined"] = float(reply["average_precision_defined"])
+                    if reply["average_precision_defined"]:
+                        expected_metrics[f"client_{client_id}_average_precision"] = reply["average_precision"]
+                actual_metrics = {key: value for name, key, value in metrics
+                                  if name == f"Round_{record['round']}"}
+                self.assertEqual(actual_metrics, expected_metrics)
+                self.assertNotIn("average_precision", actual_metrics)
                 for key in ("accuracy", "loss"):
                     actual = [value for name, metric, value in metrics
                               if name == f"Round_{record['round']}" and metric == key]
