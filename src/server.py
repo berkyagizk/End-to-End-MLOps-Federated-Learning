@@ -1,7 +1,10 @@
 import argparse
 import json
 import math
+import os
+from pathlib import Path
 import sys
+import tempfile
 
 import flwr as fl
 from flwr.common import parameters_to_ndarrays
@@ -11,10 +14,12 @@ import numpy as np
 if __package__:
     from .evaluation import COUNT_KEYS, aggregate_validation_metrics
     from .experiment import child_run_path, localhost_address, parameter_digest
+    from .global_evaluation import GlobalValidationContext, RoundParameters
     from .preprocessing import FEATURE_NAMES
 else:
     from evaluation import COUNT_KEYS, aggregate_validation_metrics
     from experiment import child_run_path, localhost_address, parameter_digest
+    from global_evaluation import GlobalValidationContext, RoundParameters
     from preprocessing import FEATURE_NAMES
 
 
@@ -61,6 +66,12 @@ def weighted_accuracy(results):
 
 
 class MLflowStrategy(fl.server.strategy.FedAvg):
+    def enrich_validation_metrics(self, server_round, metrics):
+        return metrics
+
+    def requires_metric_persistence(self):
+        return False
+
     def aggregate_fit(self, server_round, results, failures):
         if results and (self.accept_failures or not failures):
             for client, result in results:
@@ -91,6 +102,8 @@ class MLflowStrategy(fl.server.strategy.FedAvg):
         loss, metrics = super().aggregate_evaluate(server_round, results, failures)
         if loss is not None and not math.isfinite(loss):
             raise ValueError(f"Validation round {server_round}: aggregated loss must be finite")
+        if metrics:
+            metrics = self.enrich_validation_metrics(server_round, metrics)
 
         print(f"\n>>> Tur {server_round} değerlendiriliyor...")
         if metrics and "accuracy" in metrics:
@@ -98,20 +111,25 @@ class MLflowStrategy(fl.server.strategy.FedAvg):
             print(f">>> Başarı Oranı: {acc} - MLflow'a yazılıyor...")
             try:
                 with mlflow.start_run(run_name=f"Round_{server_round}"):
+                    persistence = {"synchronous": True} if self.requires_metric_persistence() else {}
                     for key, value in metrics.items():
                         if isinstance(value, (int, float, bool)):
-                            mlflow.log_metric(key, float(value), step=server_round)
-                    mlflow.log_metric("loss", loss if loss is not None else 0.0, step=server_round)
+                            mlflow.log_metric(key, float(value), step=server_round, **persistence)
+                        elif self.requires_metric_persistence() and isinstance(value, str):
+                            mlflow.set_tag(key, value, **persistence)
+                    mlflow.log_metric("loss", loss if loss is not None else 0.0, step=server_round, **persistence)
                     for _, result in results:
                         client_id = result.metrics.get("client_id")
                         if type(client_id) is int and "average_precision_defined" in result.metrics:
                             mlflow.log_metric(f"client_{client_id}_average_precision_defined",
-                                              float(result.metrics["average_precision_defined"]), step=server_round)
+                                              float(result.metrics["average_precision_defined"]), step=server_round, **persistence)
                             if result.metrics["average_precision_defined"]:
                                 mlflow.log_metric(f"client_{client_id}_average_precision",
-                                                  result.metrics["average_precision"], step=server_round)
+                                                  result.metrics["average_precision"], step=server_round, **persistence)
                 print(">>> MLflow yazma işlemi başarıyla tamamlandı.")
             except Exception as e:
+                if self.requires_metric_persistence():
+                    raise RuntimeError(f"Required MLflow persistence failed for round {server_round}") from e
                 print(f">>> MLflow HATASI: {e}")
         return loss, metrics
 
@@ -128,7 +146,7 @@ def build_strategy(num_clients):
 class ControlledStrategy(MLflowStrategy):
     """Require a complete round and record the parameters sent and received."""
 
-    def __init__(self, num_clients, rounds, report):
+    def __init__(self, num_clients, rounds, report, *, global_evaluator=None):
         super().__init__(
             min_fit_clients=num_clients,
             min_evaluate_clients=num_clients,
@@ -142,8 +160,19 @@ class ControlledStrategy(MLflowStrategy):
         self.rounds = rounds
         self.report = report
         self.round_records = []
+        self.global_evaluator = global_evaluator
+        self._pending_round = None
+        self._configured_round = None
+        self._completed_round = 0
+        self._evaluation_failed = False
 
     def configure_fit(self, server_round, parameters, client_manager):
+        if self.global_evaluator is not None:
+            if (self._evaluation_failed or type(server_round) is not int
+                    or server_round != self._completed_round + 1 or server_round > self.rounds
+                    or self._configured_round is not None or self._pending_round is not None):
+                raise RuntimeError("Missing, stale, or duplicated global evaluation round state")
+            self._configured_round = server_round
         self.sent_sha256 = parameter_digest(parameters)
         return super().configure_fit(server_round, parameters, client_manager)
 
@@ -162,13 +191,28 @@ class ControlledStrategy(MLflowStrategy):
             if (result.metrics.get("server_round") != server_round
                     or result.metrics.get("received_sha256") != expected_sha256):
                 raise RuntimeError(f"{stage} round {server_round}: client reported unexpected global parameters")
+            if self.global_evaluator is not None:
+                if type(result.metrics.get("server_round")) is not int:
+                    raise RuntimeError("Invalid client round identity")
+                client_id = result.metrics["client_id"]
+                expected = self.global_evaluator.client_identity(client_id)
+                if any(result.metrics.get(key) != value for key, value in expected.items()):
+                    raise RuntimeError(f"{stage} round {server_round}: validation context identity mismatch")
+                if stage == "validation" and result.num_examples != self.global_evaluator.client_validation_counts[client_id]:
+                    raise RuntimeError("Client validation size differs from the frozen context")
             replies.append({**result.metrics, "num_examples": result.num_examples})
         return sorted(replies, key=lambda reply: reply["client_id"])
 
     def aggregate_fit(self, server_round, results, failures):
+        if self.global_evaluator is not None:
+            if (self._evaluation_failed or self._configured_round != server_round
+                    or server_round != self._completed_round + 1 or self._pending_round is not None):
+                raise RuntimeError("Missing, stale, or duplicated fit aggregation state")
         replies = self.checked_replies("fit", server_round, results, failures, self.sent_sha256)
         parameters, metrics = super().aggregate_fit(server_round, results, failures)
         self.aggregate_sha256 = parameter_digest(parameters)
+        if self.global_evaluator is not None:
+            self._pending_round = RoundParameters.capture(server_round, parameters)
         self.round_records.append({
             "round": server_round, "sent_sha256": self.sent_sha256,
             "aggregate_sha256": self.aggregate_sha256, "fit": replies,
@@ -176,20 +220,99 @@ class ControlledStrategy(MLflowStrategy):
         return parameters, metrics
 
     def aggregate_evaluate(self, server_round, results, failures):
-        replies = self.checked_replies("validation", server_round, results, failures, self.aggregate_sha256)
-        loss, metrics = super().aggregate_evaluate(server_round, results, failures)
-        self.round_records[-1].update(validation=replies, loss=loss, accuracy=metrics["accuracy"])
-        self.round_records[-1]["validation_metrics"] = {**metrics, "loss": loss}
+        try:
+            if self._evaluation_failed or type(server_round) is not int or server_round != self._completed_round + 1:
+                raise RuntimeError("Missing, stale, duplicated, or failed round state")
+            if self.global_evaluator is not None:
+                self._check_pending_round(server_round)
+            replies = self.checked_replies("validation", server_round, results, failures, self.aggregate_sha256)
+            loss, metrics = super().aggregate_evaluate(server_round, results, failures)
+            if not self.round_records or self.round_records[-1]["round"] != server_round:
+                raise RuntimeError("Missing round report state")
+            completed = {**self.round_records[-1], "validation": replies, "loss": loss,
+                         "accuracy": metrics["accuracy"], "validation_metrics": {**metrics, "loss": loss}}
+            candidate = [*self.round_records[:-1], completed]
+            if ([row["round"] for row in candidate] != list(range(1, server_round + 1))
+                    or any("validation" not in row for row in candidate)):
+                raise RuntimeError("Round report must contain exactly the completed round prefix")
+            self._publish_round_report(candidate)
+        except Exception:
+            self._evaluation_failed = True
+            raise
+        self.round_records = candidate
+        self._completed_round = server_round
+        self._pending_round = None
+        self._configured_round = None
         print(f"Completed round {server_round}/{self.rounds} with all clients", flush=True)
         return loss, metrics
 
+    def _validate_published_report(self, expected):
+        if self.report.is_symlink():
+            raise RuntimeError("Round report must not be a symbolic link")
+        published = json.loads(self.report.read_text(encoding="utf-8"))
+        if (json.dumps(published, sort_keys=True, allow_nan=False)
+                != json.dumps(expected, sort_keys=True, allow_nan=False)):
+            raise RuntimeError("Published round report differs from completed in-memory rounds")
+
+    def _publish_round_report(self, candidate):
+        if self._completed_round:
+            self._validate_published_report(self.round_records[:-1])
+        elif self.report.exists() or self.report.is_symlink():
+            raise FileExistsError("Refusing to replace a pre-existing round report")
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n", dir=self.report.parent,
+                prefix=f".{self.report.name}.", suffix=".tmp", delete=False,
+            ) as stream:
+                temporary = Path(stream.name)
+                json.dump(candidate, stream, indent=2, allow_nan=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Same-directory replacement publishes only the complete, closed file.
+            os.replace(temporary, self.report)
+            temporary = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def _check_pending_round(self, server_round):
+        pending = self._pending_round
+        if (self._evaluation_failed or type(server_round) is not int or pending is None
+                or pending.round_number != server_round or self._configured_round != server_round
+                or server_round != self._completed_round + 1
+                or pending.digest != self.aggregate_sha256 or not self.round_records
+                or self.round_records[-1]["round"] != server_round
+                or self.round_records[-1]["aggregate_sha256"] != pending.digest):
+            raise RuntimeError("Missing, stale, duplicated, or mismatched global evaluation round state")
+        return pending.packet()
+
+    def enrich_validation_metrics(self, server_round, metrics):
+        if self.global_evaluator is None:
+            return metrics
+        packet = self._check_pending_round(server_round)
+        central_counts, diagnostics = self.global_evaluator.evaluate(packet)
+        if any(central_counts[key] != metrics[key] for key in (*COUNT_KEYS, "validation_examples")):
+            raise RuntimeError("Centralized and pooled client confusion counts disagree")
+        if diagnostics["global_evaluation_parameters_sha256"] != self.aggregate_sha256:
+            raise RuntimeError("Centralized evaluator used mismatched global parameters")
+        return {**metrics, **diagnostics}
+
+    def requires_metric_persistence(self):
+        return self.global_evaluator is not None
+
     def finish(self, history):
-        if [row["round"] for row in self.round_records if "validation" in row] != list(range(1, self.rounds + 1)):
-            raise RuntimeError("Flower returned before all fit and validation rounds completed")
-        if len(history.losses_distributed) != self.rounds:
-            raise RuntimeError("Flower history is missing validation rounds")
-        with self.report.open("x", encoding="utf-8") as stream:
-            json.dump(self.round_records, stream, indent=2, allow_nan=False)
+        try:
+            if self._evaluation_failed or self._pending_round is not None or self._completed_round != self.rounds:
+                raise RuntimeError("Global evaluation or required metric/report persistence did not complete")
+            if [row["round"] for row in self.round_records if "validation" in row] != list(range(1, self.rounds + 1)):
+                raise RuntimeError("Flower returned before all fit and validation rounds completed")
+            if len(history.losses_distributed) != self.rounds:
+                raise RuntimeError("Flower history is missing validation rounds")
+            self._validate_published_report(self.round_records)
+        except Exception:
+            self._evaluation_failed = True
+            raise
 
 
 def main():
@@ -199,6 +322,7 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--rounds", type=int, required=True)
     parser.add_argument("--round-timeout", type=float, required=True)
+    parser.add_argument("--seed", type=int, required=True)
     args = parser.parse_args()
     try:
         run_dir = child_run_path(args.run_dir)
@@ -209,6 +333,7 @@ def main():
             path = run_dir / name
             if path.exists() or path.is_symlink():
                 raise ValueError(f"Experiment output already exists: {path}")
+        global_evaluator = GlobalValidationContext.from_snapshot(run_dir / "input.csv", args.num_clients, seed=args.seed)
     except ValueError as error:
         parser.error(str(error))
 
@@ -219,7 +344,7 @@ def main():
     )
     mlflow.set_experiment(experiment_id=experiment_id)
     print(f"MLflow database: {db_path}", flush=True)
-    strategy = ControlledStrategy(args.num_clients, args.rounds, run_dir / "rounds.json")
+    strategy = ControlledStrategy(args.num_clients, args.rounds, run_dir / "rounds.json", global_evaluator=global_evaluator)
     history = fl.server.start_server(
         server_address=address,
         config=fl.server.ServerConfig(num_rounds=args.rounds, round_timeout=args.round_timeout),

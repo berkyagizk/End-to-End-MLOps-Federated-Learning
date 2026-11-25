@@ -18,6 +18,7 @@ import pandas as pd
 from run_simulation import PROJECT_ROOT, prepare_run, run_simulation, wait_for_completion
 from src.experiment import external_run_path
 from src.evaluation import aggregate_validation_metrics
+from src.global_evaluation import GlobalValidationContext, MODE
 from src.preprocessing import FEATURE_NAMES
 from src.server import ControlledStrategy
 from src.utils import build_partition_plan
@@ -136,7 +137,7 @@ class SyntheticSimulationTests(unittest.TestCase):
             port = probe.getsockname()[1]
         run = root / "experiment"
         try:
-            statuses = run_simulation(run, dataset, num_clients=2, seed=42, port=port, rounds=2, timeout=100)
+            statuses = run_simulation(run, dataset, num_clients=2, seed=17, port=port, rounds=2, timeout=100)
         except (OSError, ValueError, RuntimeError) as error:
             logs = "\n".join(f"{p.name}:\n{p.read_text(encoding='utf-8', errors='replace')[-4000:]}"
                              for p in sorted(run.glob("*.log")))
@@ -149,21 +150,41 @@ class SyntheticSimulationTests(unittest.TestCase):
         records = json.loads((run / "rounds.json").read_text(encoding="utf-8"))
         self.assertEqual([record["round"] for record in records], [1, 2])
         self.assertEqual(records[1]["sent_sha256"], records[0]["aggregate_sha256"])
-        plan = build_partition_plan(frame, 2, seed=42)
+        plan = build_partition_plan(frame, 2, seed=17)
+        context = GlobalValidationContext.from_snapshot(dataset, 2, seed=17)
+        print(f"Synthetic cached validation arrays: {context.cache_bytes} bytes")
         for record in records:
             self.assertNotEqual(record["sent_sha256"], record["aggregate_sha256"])
             for stage, expected in (("fit", record["sent_sha256"]), ("validation", record["aggregate_sha256"])):
                 replies = record[stage]
                 self.assertEqual([reply["client_id"] for reply in replies], [0, 1])
                 self.assertTrue(all(reply["received_sha256"] == expected for reply in replies))
+                for reply in replies:
+                    for key, value in context.client_identity(reply["client_id"]).items():
+                        self.assertEqual(reply[key], value)
                 split = "train" if stage == "fit" else "validation"
                 self.assertEqual([reply["num_examples"] for reply in replies],
                                  [len(getattr(client, split)) for client in plan.clients])
             pooled = aggregate_validation_metrics([(r["num_examples"], r) for r in record["validation"]])
-            self.assertEqual(record["validation_metrics"], {**pooled, "loss": record["loss"]})
+            global_metrics = record["validation_metrics"]
+            for key, value in pooled.items():
+                if not key.startswith("global_average_precision_"):
+                    self.assertEqual(global_metrics[key], value)
+            self.assertEqual(global_metrics["loss"], record["loss"])
+            self.assertTrue(global_metrics["global_average_precision_computed"])
+            self.assertTrue(global_metrics["global_average_precision_defined"])
+            self.assertEqual(global_metrics["global_average_precision_status"], "computed_exact")
+            self.assertTrue(0 <= global_metrics["global_average_precision"] <= 1)
+            self.assertEqual(global_metrics["global_evaluation_mode"], MODE)
+            self.assertEqual(global_metrics["validation_context_sha256"], context.metadata["validation_context_sha256"])
+            self.assertEqual(global_metrics["global_evaluation_parameters_sha256"], record["aggregate_sha256"])
             self.assertEqual(record["accuracy"], pooled["accuracy"])
             self.assertFalse(pooled["global_average_precision_computed"])
             self.assertNotIn("average_precision", pooled)
+        # The centralized evaluator does not add score/label/transaction output files.
+        self.assertEqual({p.name for p in run.iterdir() if p.is_file()},
+                         {"input.csv", "model.pkl", "tracking.sqlite", "rounds.json",
+                          "server.log", "client-0.log", "client-1.log"})
         uri = (run / "tracking.sqlite").resolve().as_uri() + "?mode=ro"
         with closing(sqlite3.connect(uri, uri=True)) as connection:
             rows = connection.execute("SELECT name, status, artifact_uri FROM runs ORDER BY name").fetchall()
@@ -185,6 +206,13 @@ class SyntheticSimulationTests(unittest.TestCase):
                 actual_metrics = {key: value for name, key, value in metrics
                                   if name == f"Round_{record['round']}"}
                 self.assertEqual(actual_metrics, expected_metrics)
+                tags = dict(connection.execute(
+                    "SELECT t.key, t.value FROM tags t JOIN runs r ON r.run_uuid=t.run_uuid WHERE r.name=?",
+                    (f"Round_{record['round']}",),
+                ).fetchall())
+                for key, value in record["validation_metrics"].items():
+                    if isinstance(value, str):
+                        self.assertEqual(tags[key], value)
                 self.assertNotIn("average_precision", actual_metrics)
                 for key in ("accuracy", "loss"):
                     actual = [value for name, metric, value in metrics

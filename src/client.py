@@ -19,11 +19,12 @@ else:
 
 
 class FraudClient(fl.client.NumPyClient):
-    def __init__(self, client_id, X_train, y_train, X_val, y_val, *, model_output=None):
+    def __init__(self, client_id, X_train, y_train, X_val, y_val, *, model_output=None, evaluation_identity=None):
         if not np.array_equal(np.unique(y_train), [0, 1]):
             raise ValueError("Client training labels must contain both classes 0 and 1 only")
         self.client_id = client_id
         self.model_output = model_output
+        self.evaluation_identity = dict(evaluation_identity or {})
         self.X_train = X_train
         self.y_train = np.asarray(y_train, dtype=np.int64)
         self.X_val, self.y_val = X_val, y_val
@@ -99,6 +100,7 @@ class FraudClient(fl.client.NumPyClient):
         if "server_round" not in config:
             return {}
         return {
+            **self.evaluation_identity,
             "client_id": self.client_id,
             "server_round": config["server_round"],
             "received_sha256": parameter_digest(ndarrays_to_parameters(self.get_parameters({}))),
@@ -119,8 +121,9 @@ def main():
         model_output = run_dir / "model.pkl"
         if args.client_id == 0 and (model_output.exists() or model_output.is_symlink()):
             raise ValueError("Model output already exists in the experiment directory")
-        data = load_client_data(run_dir / "input.csv", args.num_clients, args.client_id, seed=args.seed)
-        client = FraudClient(args.client_id, *data, model_output=model_output)
+        data = load_client_data(run_dir / "input.csv", args.num_clients, args.client_id,
+                                seed=args.seed, with_metadata=True)
+        client = FraudClient(args.client_id, *data[:4], model_output=model_output, evaluation_identity=data[4])
     except ValueError as error:
         parser.error(str(error))
 

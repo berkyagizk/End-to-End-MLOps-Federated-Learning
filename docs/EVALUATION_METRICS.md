@@ -1,4 +1,4 @@
-# Phase 3C-A validation diagnostics
+# Validation diagnostics: Phase 3C-A and simulation-only global AP
 
 These diagnostics apply only to each client's established validation partition.
 They do not read, score, or tune against the reserved final-test partition.
@@ -105,41 +105,115 @@ The existing per-round MLflow runs keep `accuracy` and `loss`. They additionally
 log pooled counts/rates, the fixed threshold, validation total, and support
 flags (Boolean flags become 0/1). Each available local AP is separately named
 `client_<id>_average_precision`, with a corresponding support flag. No unqualified
-global `average_precision` metric is logged. The round report records
+global `average_precision` metric is logged. Without a centralized evaluator,
+the legacy library interface records
 `global_average_precision_computed=false` and
 `global_average_precision_status="not_computed_requires_pooled_scores"`;
 MLflow records the numeric computed flag as 0.
 
-## Global AP: proposal requiring review
+## Phase 3C-B: exact centralized simulation validation AP
 
-**Exact global AP is not implemented.** Confusion counts and local AP values do
-not preserve the inter-client score ranking. For example, the test fixtures have
-two local AP values of 1, yet AP on their concatenated synthetic score/label
-vectors is below 1. Averaging the local APs would misrepresent the result.
+Controlled launcher runs now enable `GlobalValidationContext` from
+`src/global_evaluation.py`. This is explicitly **centralized single-machine
+simulation evaluation**, not a privacy-preserving institutional protocol.
+The server gains access to the snapshot and validation observations. Scalar
+sharing and metadata fingerprints do not establish privacy or compliance.
 
-The current Flower metric interface supports scalar values, not the pooled
-score-label ranking required for exact AP. The following alternatives require
-design approval before implementation:
+At startup, server and clients parse and fingerprint the same snapshot bytes.
+`prepare_partitioned_data` reuses the unchanged partition builder and shared
+preprocessor. Both the server and clients receive the launcher's seed. Training
+row positions are sorted before fitting the original scaling statistics. The
+server transforms only the sorted union of client validation rows and caches
+immutable, bytes-backed feature, label, and row-position arrays. It verifies
+disjointness from training, final test, and excluded duplicates. Full frames,
+training arrays, and the partition plan are released after initialization.
+No dataset loading or preprocessing fitting occurs in per-round evaluation.
 
-1. **Simulation-only centralized validation:** evaluate each round's aggregate
-   parameters against the fixed union of validation observations, using the
-   identical training-fitted preprocessor. This would add a server-side data and
-   preprocessing path and require strict row-membership/parity tests. It could
-   give exact pooled AP without new per-record network messages, but must be
-   explicitly described as centralized simulation evaluation.
-2. **Explicit score/label collection:** transfer each validation observation's
-   probability and label and compute AP on the pooled values. This changes the
-   evaluation communication/privacy boundary and needs explicit authorization.
-3. **Approximate histogram evaluation:** agree on fixed score bins and sum
-   positive/negative counts per bin. Validate the resulting approximation against
-   exact synthetic references, including ties and bin-resolution effects. Lost
-   within-bin ranking prevents a claim of exact AP. Histogram sharing alone is
-   not evidence of institutional privacy.
+The optional metadata interface preserves the existing four-array client loader
+return by default. Controlled clients additionally report SHA-256 fingerprints
+of input bytes, the fitted preprocessing schema/means/scales, global validation
+membership, and their assigned validation membership. The context fingerprint
+also binds seed and client count. The server checks those identities on fit and
+validation replies and checks each validation count against its prepared plan.
+These hashes check consistency between trusted simulation processes; they are
+neither authentication nor anonymization. No per-record IDs are transmitted.
 
-No option is implemented or implicitly selected here. Local AP plus pooled
-fixed-threshold metrics can be reviewed now; global AP remains an explicit
-limitation. Existing centralized preprocessing and scalar statistics likewise
-do not establish privacy guarantees or regulatory compliance.
+After each complete fit aggregation, `RoundParameters` binds immutable copies of
+the aggregate NumPy tensor bytes to the round number and parameter digest. Only
+one round may be pending. Missing, stale, duplicate, out-of-order, or mismatched
+state is rejected. Global AP is evaluated only after all required client
+validation replies and their identities have passed checks. Round zero is not
+centrally scored.
+
+Evaluation constructs a prediction-only logistic-regression object from the
+aggregate coefficients/intercept, class order `[0, 1]`, and 30-feature schema.
+It calls `predict_proba` and the existing `evaluate_binary` helper, which calls
+scikit-learn's `average_precision_score` with fraud class 1. There is no model
+fitting, SMOTE, saved-model deserialization, preprocessing refit, or model export.
+Ranking ties use scikit-learn's normal AP behavior without jitter or quantization.
+The fixed-threshold central confusion counts must exactly match pooled client
+counts before any AP is logged. A discrepancy aborts the round.
+
+When defined, `validation_metrics` and the existing `Round_N` MLflow run gain
+`global_average_precision`. Numeric computed/defined flags are logged as metrics.
+Descriptive strings are MLflow tags and JSON fields:
+
+- `global_evaluation_mode="centralized_simulation_validation"`
+- `global_average_precision_status="computed_exact"`
+- `validation_context_sha256`, dataset/preprocessing/membership fingerprints,
+  and `global_evaluation_parameters_sha256` (matching `aggregate_sha256`)
+
+Without positive validation labels, the AP value is omitted, computed/defined
+flags are false, and status is `undefined_no_positive_labels`. It is never
+replaced by zero. AP evaluation and required MLflow run/metric/tag persistence
+failures propagate in AP-enabled controlled runs. Required metric/tag writes
+explicitly use synchronous persistence, even if an ambient environment enables
+async logging. The failed round is not marked
+complete, pending state cannot be reused, and `finish` refuses a successful
+report. Partial logs/database records remain isolated for diagnosis. Legacy
+strategies without the evaluator retain their previous MLflow error policy.
+Existing pooled rates, client AP names, and top-level report fields are retained.
+
+Controlled round completion now also requires atomic JSON publication. After
+validation, AP, and required MLflow writes succeed, the server prepares a report
+containing the complete successful-round prefix. It writes a unique temporary
+file beside `rounds.json`, flushes and synchronizes that file, closes it, then
+publishes it with `os.replace`. Only after replacement succeeds does it update
+completed-round state, clear pending parameters, and announce completion.
+Temporary files are cleaned up on ordinary write/sync/replacement failures.
+Those failures mark the experiment failed and prevent pending-state reuse.
+
+A failed Round 2 write or replacement leaves the published Round 1 report
+unchanged. The server refuses a pre-existing report on first publication and
+checks the previous published content before replacing it in later rounds.
+`finish()` verifies all expected rounds, Flower history, and the already-published
+JSON; it never performs a second report write. Missing or changed final evidence
+fails validation. MLflow and JSON are separate stores, so a failed JSON write
+can leave an MLflow round record without matching JSON publication; the controlled
+experiment still fails and retains the last successfully published JSON prefix.
+
+Same-directory replacement avoids exposing a partially written report during
+ordinary operation. Synchronizing the temporary file improves durability but
+does not establish a cross-store transaction or guarantee recovery from every
+power loss/filesystem failure. Directory metadata is not explicitly synchronized.
+An abrupt process termination can leave a temporary file for later inspection.
+
+Only scalar metrics and fingerprints are added to outputs. Per-observation
+features, labels, scores, and row IDs stay transient in memory and are not added
+to JSON, logs, MLflow, or new artifact files. The launcher's pre-existing
+`input.csv` raw snapshot and validation-round `model.pkl` behavior are unchanged.
+The checkpoint's missing inference preprocessing sidecar is not resolved here.
+
+The unchanged stratified partition builder reads all source labels when defining
+the splits. Thus final-test labels are still read for partition construction,
+but are excluded from preprocessing fitting and all predictions/AP scoring.
+A stronger no-read policy would require a separate split-storage design.
+
+Collecting per-record scores/labels or aggregating approximate score histograms
+is not implemented. Flower 1.25 supports bytes payloads, so those alternatives
+are technically possible but would require a separately reviewed sharing design.
+Local AP values cannot reconstruct exact global AP: synthetic fixtures with two
+local APs of 1 have lower pooled AP because of inter-client score ordering.
 
 ## Verification
 
@@ -157,6 +231,14 @@ diagnostic validation, per-round JSON, and separated local AP logging. Existing
 regressions, including the synthetic two-client/two-round transport test, remain
 part of the suite. Model/MLflow writes in unit tests are mocked; integration
 artifacts use temporary directories. No final-test scoring is performed.
+
+Global evaluation tests cover snapshot parsing, exact validation membership,
+nondefault seeds, train-only fitting, client/server identity and array parity,
+frozen context reuse and frame release, parameter ownership and round binding,
+central/pooled confusion equivalence, known/tied/undefined AP, invalid values,
+and evaluation/MLflow failure propagation. The synthetic subprocess integration
+uses a nondefault seed and verifies global AP, metadata tags, preserved client
+metrics, complete participation, and no new observation-level output files.
 
 The integration test resolves its temporary root before comparing MLflow artifact
 URIs. Windows can expose the same temporary directory through an 8.3 alias and a

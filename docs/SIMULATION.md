@@ -12,6 +12,8 @@ client waits and reported success even when a client failed.
 
 Use the Phase 0 environment. Supply `--dataset`, `--run-dir`, `--port`,
 `--num-clients`, `--rounds`, and `--timeout` (seconds) to `run_simulation.py`.
+The existing `--seed` option defaults to 42 and is forwarded to both server and
+clients. Direct server startup also requires an explicit `--seed`.
 The run directory must be new, on a local drive, and outside the checkout.
 Its parent must exist. Use a parent directory under your control. The launcher
 checks the dataset schema and partition feasibility, probes the port, and then
@@ -35,7 +37,7 @@ to establish the isolated environment for both.
 | `artifacts/` | Explicit artifact location for the experiment |
 | `mlruns/` | MLflow's local default artifact root |
 | `model.pkl` | Latest successful client-0 validation checkpoint for this run |
-| `rounds.json` | Completed round evidence, written after Flower returns |
+| `rounds.json` | Atomically updated completed-round prefix; validated after Flower returns |
 | `tmp/`, `cache/`, `profile/` | Child runtime files, when used |
 
 The launcher retains the run directory on success or failure. It waits for
@@ -46,6 +48,40 @@ and validation reply from every configured client each round. It checks the
 clients' parameter fingerprints, delegates aggregation to the Phase 2B
 strategy, and records the aggregate fingerprint for comparison with the next
 round's input. Incomplete rounds raise an explicit error.
+
+Phase 3C-B adds exact global Average Precision through centralized simulation
+validation. The server prepares a frozen validation cache once before Flower
+startup, using the same snapshot, seed, partition rules, and train-only scaling
+as the clients. It verifies their dataset/preprocessing/membership fingerprints,
+binds each aggregate to its round, and evaluates only after complete client
+validation. Central confusion counts must match pooled client counts. Global AP
+and descriptive tags join the existing per-round MLflow run and `rounds.json`;
+client AP and pooled rates remain available. See
+[evaluation definitions and boundaries](EVALUATION_METRICS.md).
+
+This adds one server parsing/preprocessing pass and a cached validation matrix.
+Full frames and temporary training arrays are released, but startup memory can
+temporarily include the CSV bytes and several data copies. Recheck memory before
+reference-data runs. The overall launcher deadline covers this startup and
+central scoring; the existing per-RPC timeout does not bound server-only scoring.
+No extra score/label files are written. The existing raw `input.csv` snapshot
+remains. This is centralized single-machine evaluation, not institutional privacy.
+
+Central evaluation or required MLflow metric/tag persistence failures abort the
+AP-enabled run. The launcher reports the nonzero exit and cleans up its children.
+Logs and partial outputs are retained, including any existing validation-round
+checkpoint already written by client 0. A checkpoint file alone does not prove
+round completion; verify `rounds.json` and the tracking records.
+
+Each completed round must publish its JSON before completion state advances or
+the server announces success. A unique same-directory temporary file is written,
+flushed, synchronized, and closed before atomic replacement of `rounds.json`.
+Failed writes or replacements fail the experiment and preserve the preceding
+published prefix. Ordinary failure cleanup removes that attempt's temporary file.
+`finish()` validates the existing report and history without rewriting it.
+MLflow can contain partial evidence for a JSON publication failure; the whole run
+is unsuccessful. File synchronization and atomic replacement do not guarantee
+full power-loss durability or an atomic transaction with the tracking database.
 
 ## Synthetic verification
 

@@ -146,7 +146,7 @@ def run_simulation(run_dir, dataset, *, num_clients, seed, port, rounds, timeout
 
     try:
         launch("server", "src/server.py", [
-            *common, "--rounds", str(rounds), "--round-timeout", str(min(timeout, 30)),
+            *common, "--rounds", str(rounds), "--round-timeout", str(min(timeout, 30)), "--seed", str(seed),
         ])
         wait_for_server(processes["server"], run_dir / "server.log", deadline)
         for client_id in range(num_clients):

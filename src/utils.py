@@ -1,13 +1,16 @@
 from dataclasses import dataclass
+import hashlib
+from io import BytesIO
+import json
 from numbers import Integral
 
 import numpy as np
 import pandas as pd
 
 if __package__:
-    from .preprocessing import FeaturePreprocessor
+    from .preprocessing import FEATURE_NAMES, SCALED_FEATURES, SCHEMA_VERSION, FeaturePreprocessor
 else:
-    from preprocessing import FeaturePreprocessor
+    from preprocessing import FEATURE_NAMES, SCALED_FEATURES, SCHEMA_VERSION, FeaturePreprocessor
 
 
 MIN_TRAIN_PER_CLASS = 6  # SMOTE's default k_neighbors=5 needs at least six rows.
@@ -97,19 +100,64 @@ def fit_partition_preprocessor(features, plan):
     return FeaturePreprocessor.fit(features.iloc[training_rows])
 
 
-def load_client_data(file_path, num_clients, client_id, *, seed=42):
+def membership_digest(rows):
+    return hashlib.sha256(np.sort(rows).astype("<i8").tobytes()).hexdigest()
+
+
+def _json_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+def prepare_partitioned_data(file_path, num_clients, *, seed=42, with_metadata=False):
+    """Prepare once per process; fingerprint exactly the bytes parsed when requested."""
+    if with_metadata:
+        with open(file_path, "rb") as stream:
+            input_bytes = stream.read()
+        dataset_hash = hashlib.sha256(input_bytes).hexdigest()
+        frame = pd.read_csv(BytesIO(input_bytes))
+        del input_bytes
+    else:
+        frame = pd.read_csv(file_path)
+    plan = build_partition_plan(frame, num_clients, seed=seed)
+    preprocessor = fit_partition_preprocessor(frame.drop(columns="Class"), plan)
+    metadata = None
+    if with_metadata:
+        preprocessing_hash = _json_digest({
+            "schema_version": SCHEMA_VERSION, "feature_names": FEATURE_NAMES,
+            "scaled_features": SCALED_FEATURES, "mean": preprocessor.mean, "scale": preprocessor.scale,
+        })
+        validation_hash = membership_digest(np.concatenate([p.validation for p in plan.clients]))
+        metadata = {
+            "dataset_sha256": dataset_hash, "preprocessing_sha256": preprocessing_hash,
+            "global_validation_membership_sha256": validation_hash,
+            "validation_context_sha256": _json_digest({
+                "dataset": dataset_hash, "preprocessing": preprocessing_hash,
+                "validation": validation_hash, "seed": int(seed), "num_clients": int(num_clients),
+            }),
+            "client_validation_sha256": tuple(membership_digest(p.validation) for p in plan.clients),
+        }
+    return frame, plan, preprocessor, metadata
+
+
+def client_validation_identity(metadata, client_id):
+    return {**{key: value for key, value in metadata.items() if key != "client_validation_sha256"},
+            "validation_membership_sha256": metadata["client_validation_sha256"][client_id]}
+
+
+def load_client_data(file_path, num_clients, client_id, *, seed=42, with_metadata=False):
     """Return training and round-validation arrays for exactly one simulated client."""
     validate_client_count(num_clients)
     if isinstance(client_id, bool) or not isinstance(client_id, Integral) or not 0 <= client_id < num_clients:
         raise ValueError(f"client_id must be an integer in [0, {num_clients - 1}]")
 
-    frame = pd.read_csv(file_path)
-    plan = build_partition_plan(frame, num_clients, seed=seed)
+    frame, plan, preprocessor, metadata = prepare_partitioned_data(
+        file_path, num_clients, seed=seed, with_metadata=with_metadata,
+    )
     partition = plan.clients[client_id]
     features = frame.drop(columns="Class")
     labels = frame["Class"].to_numpy()
 
-    preprocessor = fit_partition_preprocessor(features, plan)
     train = preprocessor.transform(features.iloc[partition.train])
     validation = preprocessor.transform(features.iloc[partition.validation])
-    return train, labels[partition.train], validation, labels[partition.validation]
+    data = (train, labels[partition.train], validation, labels[partition.validation])
+    return (*data, client_validation_identity(metadata, client_id)) if with_metadata else data
